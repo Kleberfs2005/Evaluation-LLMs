@@ -45,10 +45,17 @@ safety_settings = [
     ),
 ]
 
+class EmptyResponseError(Exception):
+    """Levantada quando a API retorna resposta vazia/bloqueada, sem exigir o
+    construtor específico de APIError (que espera código + corpo de resposta)."""
+    pass
+
+
 # 2. Definição da função de chamada com tratamento de erros (Rate Limit / Internal Errors)
-# Correção #4: retry também captura JSONDecodeError para respostas malformadas transitórias
+# Correção #4: retry restrito a falhas transitórias esperadas (API, parsing, resposta vazia),
+# em vez de qualquer Exception (o que também repetiria bugs de programação).
 @retry(
-    retry=retry_if_exception_type(Exception), # Captura qualquer falha para tentar de novo
+    retry=retry_if_exception_type((APIError, JSONDecodeError, EmptyResponseError)),
     wait=wait_exponential(multiplier=2, min=15, max=120),  
     stop=stop_after_attempt(5),
     reraise=True
@@ -67,9 +74,11 @@ def call_llm_judge(system_prompt: str, user_prompt: str) -> dict:
         )
     )
 
-    # Correção #3: guarda contra resposta vazia ou None
+    # Correção #3: guarda contra resposta vazia ou None.
+    # Usa EmptyResponseError (não APIError, que exige código + corpo de resposta
+    # no construtor e levantaria TypeError se instanciada só com uma string).
     if not response.text:
-        raise APIError("Resposta vazia ou bloqueada pela API.")
+        raise EmptyResponseError("Resposta vazia ou bloqueada pela API.")
 
     # Faz o parse da string JSON retornada pelo modelo
     return json.loads(response.text)
@@ -93,20 +102,40 @@ def main():
     processed_ids = set()   # instâncias concluídas com sucesso — não serão reprocessadas
     error_ids = set()       # instâncias com erro — serão reprocessadas normalmente
 
+    # Correção #3 (deduplicação): mantém só o registro mais recente por instance_id.
+    # Como o arquivo é escrito em modo 'append' ao longo de execuções sucessivas, uma
+    # mesma instância pode ter múltiplas linhas (ex: erro em uma execução, sucesso em
+    # outra). Consolidamos aqui e reescrevemos o arquivo limpo antes de prosseguir.
+    latest_records = {}
+
     if os.path.exists(output_file):
         with open(output_file, 'r', encoding='utf-8') as f:
             for line in f:
                 if not line.strip():
                     continue
-                record = json.loads(line)
-                if 'error' in record:
-                    error_ids.add(record['instance_id'])
-                else:
-                    processed_ids.add(record['instance_id'])
+                try:
+                    record = json.loads(line)
+                except JSONDecodeError:
+                    logging.warning(f"Linha inválida em {output_file} ignorada: {line[:200]!r}")
+                    continue
+                # Linhas mais recentes (mais abaixo no arquivo) sobrescrevem as antigas
+                latest_records[record['instance_id']] = record
+
+        for instance_id, record in latest_records.items():
+            if 'error' in record:
+                error_ids.add(instance_id)
+            else:
+                processed_ids.add(instance_id)
+
+        # Reescreve o arquivo de saída já deduplicado
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for record in latest_records.values():
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
         logging.info(
             f"Retomando: {len(processed_ids)} instâncias já avaliadas com sucesso, "
-            f"{len(error_ids)} com erro (serão reprocessadas)."
+            f"{len(error_ids)} com erro (serão reprocessadas). "
+            f"Arquivo de saída deduplicado ({len(latest_records)} registros únicos)."
         )
 
     logging.info(f"Iniciando avaliação de {total_instances} instâncias...")
@@ -122,8 +151,14 @@ def main():
             if not line.strip():
                 continue
 
-            payload = json.loads(line)
-            instance_id = payload['instance_id']
+            # Correção: parse do payload protegido para não derrubar o script
+            # inteiro por causa de uma única linha malformada no arquivo de entrada.
+            try:
+                payload = json.loads(line)
+                instance_id = payload['instance_id']
+            except (JSONDecodeError, KeyError) as e:
+                logging.error(f"Linha malformada no payload (ignorada): {e} | conteúdo: {line[:200]!r}")
+                continue
 
             # Pula apenas os que já foram processados com sucesso
             if instance_id in processed_ids:
