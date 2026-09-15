@@ -11,7 +11,7 @@ DIRETORIO_CACHE_MIRRORS = "./cache_repos_mirror"   # espelhos (--mirror), um por
 ARQUIVO_CHECKPOINT = "progresso_sonar.json"        # registra instâncias já concluídas
 SONAR_HOST = "http://localhost:9000"
 
-# O token nunca deve ficar hardcoded no código-fonte.
+# O token ficou hardcoded no código fonte.
 # Defina a variável de ambiente antes de rodar o script, ex.:
 #   export SONAR_TOKEN="squ_..."      (Linux/macOS)
 #   set SONAR_TOKEN=squ_...           (Windows)
