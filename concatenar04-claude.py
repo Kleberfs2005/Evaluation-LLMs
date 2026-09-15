@@ -8,6 +8,9 @@ from datasets import load_dataset
 input_predictions_file = 'all_preds-Verified-rag-gpt4.jsonl'
 output_payload_file    = 'evaluation_payload.jsonl'
 
+# Intervalo de linhas para exibir progresso durante o processamento
+PROGRESS_INTERVAL = 50
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PROMPTS — LLM-as-a-Judge
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +82,11 @@ if not os.path.isfile(input_predictions_file):
     print(f"Arquivos no diretório atual: {os.listdir('.')}")
     exit(1)
 
+# Aviso caso o arquivo de saída já exista e vá ser sobrescrito
+if os.path.isfile(output_payload_file):
+    print(f"[AVISO] O arquivo de saída '{output_payload_file}' já existe e será "
+          f"sobrescrito por esta execução.")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Carregar o dataset oficial do SWE-bench Verified
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +103,10 @@ print(f"Dataset indexado: {len(swe_dict)} instâncias carregadas.")
 # 3 e 4. Iterar sobre predições e montar payload de avaliação
 # ─────────────────────────────────────────────────────────────────────────────
 total, gerados, ignorados = 0, 0, 0
+malformados, nao_encontrados, duplicados = 0, 0, 0
+vistos = set()
+
+print("Processando predições...")
 
 with open(input_predictions_file, 'r', encoding='utf-8') as infile, \
      open(output_payload_file,    'w', encoding='utf-8') as outfile:
@@ -104,17 +116,42 @@ with open(input_predictions_file, 'r', encoding='utf-8') as infile, \
             continue
 
         total += 1
-        pred_data   = json.loads(line)
-        instance_id = pred_data.get('instance_id')
-        model_patch = pred_data.get('model_patch', '')
 
-        if instance_id not in swe_dict:
-            print(f"  [AVISO] instance_id não encontrado no dataset: {instance_id}")
+        if total % PROGRESS_INTERVAL == 0:
+            print(f"  ... {total} linhas processadas "
+                  f"({gerados} payloads gerados, {ignorados} ignorados)")
+
+        # ── 1. Tratamento de JSON malformado ──────────────────────────────
+        try:
+            pred_data = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(f"  [AVISO] Linha {total} malformada, ignorada: {e}")
+            malformados += 1
             ignorados += 1
             continue
 
+        instance_id = pred_data.get('instance_id')
+        model_patch = pred_data.get('model_patch', '')
+
+        # ── 2. Tratamento de instance_id duplicado ─────────────────────────
+        if instance_id in vistos:
+            print(f"  [AVISO] instance_id duplicado, ignorado: {instance_id}")
+            duplicados += 1
+            ignorados += 1
+            continue
+
+        if instance_id not in swe_dict:
+            print(f"  [AVISO] instance_id não encontrado no dataset: {instance_id}")
+            nao_encontrados += 1
+            ignorados += 1
+            continue
+
+        vistos.add(instance_id)
         problem_statement = swe_dict[instance_id]
 
+        # Nota: chave 'model_patch' ausente e patch vazio ('' ou None) são
+        # tratados da mesma forma abaixo (ambos viram o placeholder), pois o
+        # juiz deve classificar resolve_issue=false em qualquer um dos casos.
         user_prompt = USER_PROMPT_TEMPLATE.format(
             problem_statement=problem_statement,
             model_patch=model_patch if model_patch else "(patch vazio ou ausente)",
@@ -133,7 +170,10 @@ with open(input_predictions_file, 'r', encoding='utf-8') as infile, \
 # RELATÓRIO FINAL
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\nConcluído.")
-print(f"  Total de linhas lidas : {total}")
-print(f"  Payloads gerados      : {gerados}")
-print(f"  Instâncias ignoradas  : {ignorados}")
-print(f"  Arquivo de saída      : {output_payload_file}")
+print(f"  Total de linhas lidas       : {total}")
+print(f"  Payloads gerados            : {gerados}")
+print(f"  Instâncias ignoradas (total): {ignorados}")
+print(f"    - JSON malformado         : {malformados}")
+print(f"    - instance_id duplicado   : {duplicados}")
+print(f"    - instance_id não achado  : {nao_encontrados}")
+print(f"  Arquivo de saída            : {output_payload_file}")
