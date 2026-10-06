@@ -9,37 +9,25 @@ from requests.adapters import HTTPAdapter, Retry
 # --- Configurações ---
 SONAR_HOST = os.environ.get("SONAR_HOST", "http://localhost:9000")
 
-# IMPORTANTE: o token está no hardcoded no código-fonte.
-# Defina a variável de ambiente antes de rodar, por exemplo (PowerShell):
+# IMPORTANTE: o token NÃO fica hardcoded no código-fonte.
+# A variável de ambiente devará ser setada antes de rodar, por exemplo (PowerShell):
 #   $env:SONAR_TOKEN = "seu_token_aqui"
 # ou (cmd):
 #   set SONAR_TOKEN=seu_token_aqui
 SONAR_TOKEN = os.environ.get("SONAR_TOKEN")
 
-# Se você precisa medir uma branch específica (não a principal), defina aqui.
-# Deixe como None para usar a branch padrão do projeto.
+# Medição de uma branch específica (não a principal), defina aqui.
+# Deixa como None para usar a branch padrão do projeto.
 BRANCH = os.environ.get("SONAR_BRANCH")  # ex: "main" ou None
 
 DIRETORIO_SAIDA = os.environ.get("DIRETORIO_SAIDA", r"G:\trab-ia03")
 
-ARQUIVO_CSV = os.path.join(DIRETORIO_SAIDA, "metricas_swebench.csv")
-ARQUIVO_JSON = os.path.join(DIRETORIO_SAIDA, "metricas_swebench.json")
-ARQUIVO_LOG_ERROS = os.path.join(DIRETORIO_SAIDA, "erros_extracao.log")
-
-# Lista exata das métricas que serão extraídas.
-# Chaves confirmadas como válidas na documentação atual do SonarQube (2026.1).
-# Adicione outras chaves oficiais do SonarQube se necessário para sua dissertação.
-METRICAS = [
-    "complexity",            # Complexidade Ciclomática (McCabe)
-    "cognitive_complexity",  # Complexidade Cognitiva
-    "ncloc",                 # Linhas de Código Não-Comentadas
-    "bugs",
-    "vulnerabilities",
-    "code_smells",
-    "sqale_index",           # Dívida Técnica (em minutos)
-]
+ARQUIVO_CSV = os.path.join(DIRETORIO_SAIDA, "metricas_completas_swebench.csv")
+ARQUIVO_JSON = os.path.join(DIRETORIO_SAIDA, "metricas_completas_swebench.json")
+ARQUIVO_LOG_ERROS = os.path.join(DIRETORIO_SAIDA, "erros_extracao_completa.log")
 
 TIMEOUT_SEGUNDOS = 30
+TAMANHO_LOTE_METRICAS = 50  # Respeita limites de URL GET
 
 
 def criar_sessao():
@@ -62,12 +50,30 @@ def criar_sessao():
     return sessao
 
 
+def obter_todas_chaves_metricas(sessao):
+    print("Consultando dicionário de métricas do SonarQube...")
+    url = f"{SONAR_HOST}/api/metrics/search"
+    try:
+        resposta = sessao.get(url, params={"ps": 500}, timeout=TIMEOUT_SEGUNDOS)
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Falha de conexão ao obter dicionário de métricas: {e}")
+
+    if resposta.status_code != 200:
+        raise Exception(f"Falha ao obter dicionário de métricas. Status: {resposta.status_code} - {resposta.text}")
+
+    metricas = resposta.json().get("metrics", [])
+    # Filtra apenas as métricas numéricas ou textuais que fazem sentido exportar
+    chaves = [m["key"] for m in metricas if m["type"] not in ["DATA"]]
+    print(f"Total de tipos de métricas mapeadas: {len(chaves)}")
+    return chaves
+
+
 def obter_todos_projetos(sessao):
     projetos = []
     pagina = 1
-    tamanho_pagina = 100  # O limite seguro para paginação no SonarQube
+    tamanho_pagina = 100
 
-    print("Mapeando projetos no SonarQube...")
+    print("Mapeando projetos...")
     while True:
         url = f"{SONAR_HOST}/api/components/search"
         parametros = {"qualifiers": "TRK", "ps": tamanho_pagina, "p": pagina}
@@ -89,90 +95,95 @@ def obter_todos_projetos(sessao):
 
         for comp in componentes:
             projetos.append(comp["key"])
-
         pagina += 1
 
     print(f"Total de projetos encontrados: {len(projetos)}")
     return projetos
 
 
-def exportar_metricas():
+def chunk_list(lista, tamanho):
+    """Divide uma lista em sublistas menores para evitar URLs muito longas."""
+    for i in range(0, len(lista), tamanho):
+        yield lista[i:i + tamanho]
+
+
+def exportar_metricas_totais():
     os.makedirs(DIRETORIO_SAIDA, exist_ok=True)
     sessao = criar_sessao()
 
+    chaves_totais = obter_todas_chaves_metricas(sessao)
     projetos = obter_todos_projetos(sessao)
-    if not projetos:
-        print("Nenhum projeto encontrado para exportação.")
+
+    if not projetos or not chaves_totais:
+        print("Operação abortada: Projetos ou métricas não encontrados.")
         return
 
-    chaves_metricas_str = ",".join(METRICAS)
     resultados_finais = []
     erros = []
+    print("\nExtraindo dados...")
 
-    print("Extraindo métricas individuais...")
     for index, projeto_key in enumerate(projetos, 1):
-        url = f"{SONAR_HOST}/api/measures/component"
-        parametros = {"component": projeto_key, "metricKeys": chaves_metricas_str}
-        if BRANCH:
-            parametros["branch"] = BRANCH
-
-        try:
-            resposta = sessao.get(url, params=parametros, timeout=TIMEOUT_SEGUNDOS)
-        except requests.exceptions.RequestException as e:
-            msg = f"[{index}/{len(projetos)}] Falha de conexão em {projeto_key}: {e}"
-            print(msg)
-            erros.append(msg)
-            continue
-
-        if resposta.status_code != 200:
-            msg = f"[{index}/{len(projetos)}] Erro ao extrair {projeto_key}: {resposta.status_code} - {resposta.text}"
-            print(msg)
-            erros.append(msg)
-            continue
-
-        medidas = resposta.json().get("component", {}).get("measures", [])
-
-        # Estrutura base da linha para este projeto
         linha_dados = {"instance_id": projeto_key}
+        # Inicializa todas as chaves como N/A para evitar colunas vazias no CSV
+        for chave in chaves_totais:
+            linha_dados[chave] = "N/A"
 
-        # Inicializa todas as métricas requisitadas como N/A para evitar buracos nos dados
-        for metrica in METRICAS:
-            linha_dados[metrica] = "N/A"
+        # Pede as métricas em lotes para respeitar limites de URL GET
+        sucesso_projeto = True
+        for lote_chaves in chunk_list(chaves_totais, TAMANHO_LOTE_METRICAS):
+            chaves_str = ",".join(lote_chaves)
+            url = f"{SONAR_HOST}/api/measures/component"
+            parametros = {"component": projeto_key, "metricKeys": chaves_str}
+            if BRANCH:
+                parametros["branch"] = BRANCH
 
-        # Preenche os valores encontrados
-        for medida in medidas:
-            linha_dados[medida["metric"]] = medida.get("value", "N/A")
+            try:
+                resposta = sessao.get(url, params=parametros, timeout=TIMEOUT_SEGUNDOS)
+            except requests.exceptions.RequestException as e:
+                sucesso_projeto = False
+                erros.append(f"[{index}/{len(projetos)}] {projeto_key}: falha de conexão - {e}")
+                continue
+
+            if resposta.status_code == 200:
+                medidas = resposta.json().get("component", {}).get("measures", [])
+                for medida in medidas:
+                    linha_dados[medida["metric"]] = medida.get("value", "N/A")
+            else:
+                sucesso_projeto = False
+                erros.append(
+                    f"[{index}/{len(projetos)}] {projeto_key}: {resposta.status_code} - {resposta.text}"
+                )
+
+        if sucesso_projeto:
+            print(f"[{index}/{len(projetos)}] Exportado: {projeto_key}")
+        else:
+            print(f"[{index}/{len(projetos)}] Erro parcial na extração de: {projeto_key}")
 
         resultados_finais.append(linha_dados)
-        print(f"[{index}/{len(projetos)}] Sucesso: {projeto_key}")
 
-        # Pequena pausa para não sobrecarregar a API em análises com muitos projetos
+        # Pequena pausa para não sobrecarregar a API (cada projeto já gera vários requests em lote)
         time.sleep(0.05)
 
-    # Gravação no disco
-    # 1. Exportação JSON
+    # Gravação JSON
     with open(ARQUIVO_JSON, "w", encoding="utf-8") as f:
         json.dump(resultados_finais, f, indent=4, ensure_ascii=False)
 
-    # 2. Exportação CSV
-    colunas = ["instance_id"] + METRICAS
+    # Gravação CSV
+    colunas = ["instance_id"] + chaves_totais
     with open(ARQUIVO_CSV, "w", newline="", encoding="utf-8") as f:
         escritor = csv.DictWriter(f, fieldnames=colunas)
         escritor.writeheader()
         escritor.writerows(resultados_finais)
 
-    # 3. Log de erros, se houver, para rastreabilidade na dissertação
+    # Log de erros, se houver, para rastreabilidade na dissertação
     if erros:
         with open(ARQUIVO_LOG_ERROS, "w", encoding="utf-8") as f:
             f.write("\n".join(erros))
 
-    print(f"\nExtração concluída.")
-    print(f"Projetos processados com sucesso: {len(resultados_finais)}/{len(projetos)}")
+    print(f"\nFinalizado. CSV bruto com todas as variáveis gerado em: {ARQUIVO_CSV}")
     if erros:
-        print(f"Projetos com erro: {len(erros)} (ver {ARQUIVO_LOG_ERROS})")
-    print(f"Arquivo CSV salvo em: {ARQUIVO_CSV}")
-    print(f"Arquivo JSON salvo em: {ARQUIVO_JSON}")
+        print(f"Ocorreram {len(erros)} erros/lotes com falha (ver {ARQUIVO_LOG_ERROS})")
 
 
 if __name__ == "__main__":
-    exportar_metricas()
+    exportar_metricas_totais()
